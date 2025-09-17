@@ -1,0 +1,575 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, doc, addDoc, collection, serverTimestamp, onSnapshot, getDoc, getDocs, deleteDoc, setDoc, query } from 'firebase/firestore';
+
+// --- Constantes y Funciones del Motor de Diagnóstico ---
+
+const MAX_ITER = 3;
+const HUMAN_ACCEPTANCE_THRESHOLD = 0.85;
+
+const apiKey = ""; // Injected by the environment
+const GEMINI_MODEL = "gemini-2.5-flash-preview-05-20";
+const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+
+// Función para llamar a la API de Gemini con reintentos
+const callGeminiAPI = async (prompt, schema = null, retries = 5, delay = 1000) => {
+  let payload = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
+  if (schema) {
+    payload.generationConfig = { responseMimeType: "application/json", responseSchema: schema };
+  }
+
+  for (let i = 0; i < retries; i++) {
+    try {
+      const response = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.json();
+        console.error(`Error ${response.status}:`, errorBody);
+        if (response.status === 429 && i < retries - 1) {
+          await new Promise(res => setTimeout(res, delay));
+          delay *= 2;
+          continue;
+        }
+        throw new Error(`Error de API: ${response.status} ${errorBody.error?.message || response.statusText}`);
+      }
+
+      const result = await response.json();
+      const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (text) {
+        try {
+          const jsonMatch = text.match(/^```json\n([\s\S]*?)\n```/);
+          return JSON.parse(jsonMatch ? jsonMatch[1] : text);
+        } catch (e) {
+          console.warn("Error al parsear JSON, reintentando:", e);
+          return schema ? JSON.parse(text) : text;
+        }
+      } else {
+        throw new Error("Respuesta inesperada de Gemini.");
+      }
+    } catch (error) {
+      console.error("Fallo la llamada a Gemini:", error);
+      if (i < retries - 1) {
+        await new Promise(res => setTimeout(res, delay));
+        delay *= 2;
+      } else {
+        throw error;
+      }
+    }
+  }
+  throw new Error("Fallo la llamada a Gemini despues de multiples reintentos.");
+};
+
+// Esquemas JSON para las respuestas de la IA
+const moduleOutputSchema = { type: "OBJECT", properties: { module: { type: "STRING" }, iteration: { type: "NUMBER" }, outputs: { type: "ARRAY", items: { type: "OBJECT", properties: { code_icd10: { type: "STRING" }, label: { type: "STRING" }, prob: { type: "NUMBER" }, rationale: { type: "STRING" }, expected_symptoms: { type: "ARRAY", items: { type: "STRING" } } } } } }, required: ["module", "iteration", "outputs"] };
+const consensusOutputSchema = { 
+    type: "OBJECT", 
+    properties: { 
+        top_diagnoses: { 
+            type: "ARRAY", 
+            items: { 
+                type: "OBJECT", 
+                properties: { 
+                    code_icd10: { type: "STRING" }, 
+                    label: { type: "STRING" }, 
+                    prob: { type: "NUMBER" } 
+                } 
+            },
+            minItems: 5,
+            maxItems: 5
+        }, 
+        evidence_analysis: {
+            type: "OBJECT",
+            properties: {
+                supporting_evidence: { type: "ARRAY", items: { type: "STRING" } },
+                refuting_evidence: { type: "ARRAY", items: { type: "STRING" } }
+            }
+        },
+        recommendations: { 
+            type: "OBJECT", 
+            properties: { 
+                pruebas_imprescindibles: { type: "ARRAY", items: { type: "STRING" } }, 
+                urgencias_derivacion: { type: "ARRAY", items: { type: "STRING" } }, 
+                tratamiento_inicial: { type: "ARRAY", items: { type: "STRING" } } 
+            } 
+        }, 
+        discrepancies: { type: "STRING" } 
+    }, 
+    required: ["top_diagnoses", "evidence_analysis", "recommendations"] 
+};
+
+// Generadores de Prompts para la IA
+const generateModulePrompt = (module, data, iteration, prevOutputs = {}) => {
+  let { summary, signs, symptoms, labs, imagesSummary, age, sexo } = data;
+  let region = "Cuba"; let epidata = "Prevalencia de ERC alta en mayores de 50 con HTA/DM en Cuba.";
+  let outputsC_str = prevOutputs.C ? JSON.stringify(prevOutputs.C.outputs) : '[]';
+  let outputsF_str = prevOutputs.F ? JSON.stringify(prevOutputs.F.outputs) : '[]';
+
+  switch (module) {
+    case "CLINICO":
+        let prevIterationSummary = '';
+        if (iteration > 1 && prevOutputs.C) {
+            const prevTopDx = prevOutputs.C.outputs?.[0];
+            if (prevTopDx) {
+               prevIterationSummary = ` En la iteración anterior, la hipótesis principal fue '${prevTopDx.label}' con una probabilidad de ${prevTopDx.prob.toFixed(2)} basado en '${prevTopDx.rationale}'. Re-evalúa el caso, considerando esta hipótesis para refinar el diagnóstico.`;
+            }
+        }
+        return `Eres un razonador clínico. Entrada: patient_summary: ${summary}, signos: ${signs}, síntomas: ${symptoms}, labs: ${labs}, imágenes: ${imagesSummary}.${prevIterationSummary} Tarea: Genera TOP-5 diagnósticos clínicos ordenados por probabilidad (0-1), explicar en 1-2 frases por diagnóstico por qué se sugiere y listar los hallazgos que soportan cada diagnóstico. Además, genera los "síntomas esperados" que deberían aparecer si el diagnóstico fuera cierto (máx 6 items). Responde en JSON con campos: module: "C", iteration: ${iteration}, outputs: [{code_icd10: "ICD10_CODE", label: "Diagnostic Label", prob: 0.X, rationale: "Reason", expected_symptoms: ["Symptom1", "Symptom2"]}].`;
+    case "FISIO": 
+        return `Eres un razonador fisiopatológico. Entrada: patient_summary: ${summary}, signos: ${signs}, síntomas: ${symptoms}, labs: ${labs}, imágenes: ${imagesSummary}. Diagnósticos sugeridos por el módulo Clínico (C) en esta iteración: ${outputsC_str}. Tarea: Para cada diagnóstico sugerido, describe el mecanismo causal (cadena: causa -> lesión -> síntoma) y estimar probabilidad ajustada. Sugiere tratamientos iniciales de base fisiopatológica. Genera expected_symptoms por diagnóstico. Salida JSON: module: "F", iteration:${iteration}, outputs: [{code_icd10: "ICD10_CODE", label: "Diagnostic Label", prob: 0.X, rationale: "Reason", expected_symptoms: ["Symptom1", "Symptom2"]}].`;
+    case "EPID": 
+        return `Eres un analista epidemiológico. Entrada: paciente demografía: edad: ${age}, sexo: ${sexo}, region: ${region}, prevalencias locales: ${epidata}. Outputs de Módulo Clínico (C): ${outputsC_str}. Outputs de Módulo Fisiopatológico (F): ${outputsF_str}. Tarea: Ajusta probabilidades para cada diagnóstico según prevalencia, factores de riesgo y demografía; ofrece factor de ajuste (0.0-2.0) y justificación. Salida JSON: module: "E", iteration:${iteration}, outputs: [{code_icd10: "ICD10_CODE", label: "Diagnostic Label", prob: 0.X, rationale: "Reason", expected_symptoms: ["Symptom1", "Symptom2"]}].`;
+  } 
+  return "";
+};
+const generateConsensusPrompt = (moduleOutputs, patientData) => `Recibe outputs de los módulos Clínico (C): ${JSON.stringify(moduleOutputs.C?.outputs || [])}, Fisiopatológico (F): ${JSON.stringify(moduleOutputs.F?.outputs || [])}, y Epidemiológico (E): ${JSON.stringify(moduleOutputs.E?.outputs || [])}. Tarea: 1. Calcula el consenso diagnóstico por método weighted_mean (usa 1/3 para cada uno) y devuelve los TOP-5 diagnósticos diferenciales ordenados por probabilidad. 2. Para el diagnóstico principal, analiza los datos del paciente (${JSON.stringify(patientData)}) y provee una lista de 'evidencia de apoyo' (datos que confirman la hipótesis) y 'evidencia en contra' (datos que la contradicen o no se esperan). 3. Ofrece recomendaciones: (a) pruebas imprescindibles (b) urgencias/derivación (c) tratamiento inicial sugerido. 4. Explique discrepancias si prob difiere >0.15 entre módulos. Responde en JSON.`;
+
+
+// --- Componentes de UI ---
+
+const AccordionSection = ({ title, sectionName, children, expandedSections, onToggle }) => (
+  <div className="bg-white rounded-lg shadow-md mb-4 overflow-hidden">
+    <button
+      className="w-full text-left p-4 flex justify-between items-center text-blue-800 font-semibold text-lg hover:bg-gray-50 transition-colors"
+      onClick={() => onToggle(sectionName)}
+    >
+      <span>{title}</span>
+      <svg className={`w-6 h-6 transform transition-transform duration-300 ${expandedSections[sectionName] ? 'rotate-180' : ''}`} fill="currentColor" viewBox="0 0 20 20">
+        <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
+      </svg>
+    </button>
+    <div className={`transition-all duration-300 ease-in-out ${expandedSections[sectionName] ? 'max-h-screen p-4' : 'max-h-0'}`}>
+      <div className={`${expandedSections[sectionName] ? 'overflow-visible' : 'overflow-hidden'}`}>{children}</div>
+    </div>
+  </div>
+);
+
+const PatientForm = ({
+  selectedPatient, db, userId, loading, setLoading, showMessage, onResetForm,
+  selectedConsultationId, setSelectedConsultationId, runCaseSimulation,
+  setDiagnosticoNosologico, diagnosticoNosologico
+}) => {
+  const [expandedSections, setExpandedSections] = useState({ datosGenerales: true, motivoConsulta: false, antecedentes: false, examenFisico: false, diagnostico: false, tratamiento: false });
+  const [datosGenerales, setDatosGenerales] = useState({ nombre: '', edad: '', sexo: '', telefono: '', direccion: '', fechaNacimiento: '' });
+  const [antecedentesPersonales, setAntecedentesPersonales] = useState({ enfermedades: '', cirugias: '', alergias: '', medicamentos: '', habitos: '' });
+  const [antecedentesFamiliares, setAntecedentesFamiliares] = useState({ padres: '', hermanos: '', abuelos: '', otros: '' });
+  const [motivoConsulta, setMotivoConsulta] = useState('');
+  const [historiaEnfermedad, setHistoriaEnfermedad] = useState('');
+  const [examenFisico, setExamenFisico] = useState({ otros: '' });
+  const [examenesLaboratorio, setExamenesLaboratorio] = useState({ otros: '' });
+  const [diagnosticoDiferencial, setDiagnosticoDiferencial] = useState('');
+  const [tratamiento, setTratamiento] = useState('');
+
+  useEffect(() => {
+    const loadData = async () => {
+      if (!selectedPatient) { resetFormFields(); return; }
+      setLoading(true);
+      try {
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const docRef = doc(db, `/artifacts/${appId}/users/${userId}/pacientes/${selectedPatient.id}`);
+        const docSnap = await getDoc(docRef);
+        if (docSnap.exists()) {
+          const patientData = docSnap.data();
+          setDatosGenerales(patientData.datosGenerales || {});
+          const consultasRef = collection(db, docRef.path, 'consultas');
+          const consultaSnap = await getDocs(query(consultasRef));
+          if (!consultaSnap.empty) {
+            const allConsultations = consultaSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            allConsultations.sort((a, b) => (b.createdAt?.toMillis() || 0) - (a.createdAt?.toMillis() || 0));
+            const latest = allConsultations[0];
+            setAntecedentesPersonales(latest.antecedentesPersonales || {});
+            setAntecedentesFamiliares(latest.antecedentesFamiliares || {});
+            setMotivoConsulta(latest.motivoConsulta || '');
+            setHistoriaEnfermedad(latest.historiaEnfermedad || '');
+            setExamenFisico(latest.examenFisico || {});
+            setDiagnosticoNosologico(latest.diagnosticoNosologico || '');
+            setExamenesLaboratorio(latest.examenesLaboratorio || {});
+            setDiagnosticoDiferencial(latest.diagnosticoDiferencial || '');
+            setTratamiento(latest.tratamiento || '');
+            setSelectedConsultationId(latest.id);
+          } else { resetConsultationFields(); }
+        } else { showMessage("No se encontraron datos."); resetFormFields(); }
+      } catch (error) { console.error("Error loading data:", error); showMessage("Error al cargar datos."); } 
+      finally { setLoading(false); }
+    };
+    if (db && userId) { loadData(); }
+  }, [selectedPatient, db, userId, setLoading, showMessage, setSelectedConsultationId, setDiagnosticoNosologico]);
+  
+  const resetFormFields = () => {
+    setDatosGenerales({ nombre: '', edad: '', sexo: '', telefono: '', direccion: '', fechaNacimiento: '' });
+    resetConsultationFields();
+  };
+  
+  const resetConsultationFields = () => {
+    setAntecedentesPersonales({}); setAntecedentesFamiliares({}); setMotivoConsulta('');
+    setHistoriaEnfermedad(''); setExamenFisico({}); setDiagnosticoNosologico('');
+    setExamenesLaboratorio({}); setDiagnosticoDiferencial(''); setTratamiento('');
+    setSelectedConsultationId(null);
+  };
+  
+  const guardarHistoriaClinica = async () => {
+    if (!userId || !db || !datosGenerales.nombre.trim()) { showMessage("Nombre del paciente es requerido."); return; }
+    setLoading(true);
+    try {
+      const consultaData = { antecedentesPersonales, antecedentesFamiliares, motivoConsulta, historiaEnfermedad, examenFisico, diagnosticoNosologico, examenesLaboratorio, diagnosticoDiferencial, tratamiento, createdAt: serverTimestamp() };
+      const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+      const path = `/artifacts/${appId}/users/${userId}/pacientes`;
+      if (selectedPatient) {
+        const patientDocRef = doc(db, path, selectedPatient.id);
+        await setDoc(patientDocRef, { datosGenerales }, { merge: true });
+        const ref = selectedConsultationId ? doc(patientDocRef, 'consultas', selectedConsultationId) : collection(patientDocRef, 'consultas');
+        await (selectedConsultationId ? setDoc(ref, consultaData, { merge: true }) : addDoc(ref, consultaData));
+        showMessage(selectedConsultationId ? "Historia actualizada." : "Nueva consulta guardada.");
+      } else {
+        const newPatientRef = await addDoc(collection(db, path), { datosGenerales, createdAt: serverTimestamp() });
+        await addDoc(collection(newPatientRef, 'consultas'), consultaData);
+        showMessage("Nueva historia guardada.");
+        onResetForm();
+      }
+    } catch (error) { console.error("Error guardando:", error); showMessage("Error al guardar."); } 
+    finally { setLoading(false); }
+  };
+
+  const handleRunAnalysis = () => {
+      const engineData = {
+          summary: `Motivo: ${motivoConsulta}. Historia: ${historiaEnfermedad}. Antecedentes: ${antecedentesPersonales.enfermedades}`,
+          signs: examenFisico.otros, symptoms: motivoConsulta, labs: examenesLaboratorio.otros,
+          imagesSummary: examenesLaboratorio.imagenologia, age: datosGenerales.age, sexo: datosGenerales.sexo
+      };
+      runCaseSimulation(engineData);
+  };
+
+  const startNewConsultation = () => { resetConsultationFields(); showMessage(`Creando nueva consulta para ${selectedPatient.datosGenerales.nombre}.`); };
+  const toggleSection = (sectionName) => setExpandedSections(p => ({ ...p, [sectionName]: !p[sectionName] }));
+  
+  return (
+    <div className="flex-grow max-w-2xl bg-white rounded-lg shadow-lg p-6 h-full overflow-y-auto">
+      <h1 className="text-2xl font-bold text-center mb-2 text-blue-800">Historia Clínica</h1>
+      <p className="text-sm text-center text-gray-500 mb-6">{selectedPatient ? `Paciente: ${selectedPatient.datosGenerales.nombre}` : 'Crea una nueva historia'}</p>
+      
+      <AccordionSection title="1. Datos Generales" sectionName="datosGenerales" expandedSections={expandedSections} onToggle={toggleSection}>
+        <div className="space-y-4">
+          <input type="text" placeholder="Nombre completo" value={datosGenerales.nombre} onChange={e => setDatosGenerales({...datosGenerales, nombre: e.target.value})} className="w-full p-2 border rounded-lg"/>
+          <input type="text" placeholder="Edad" value={datosGenerales.edad} onChange={e => setDatosGenerales({...datosGenerales, edad: e.target.value})} className="w-full p-2 border rounded-lg"/>
+          <input type="text" placeholder="Sexo" value={datosGenerales.sexo} onChange={e => setDatosGenerales({...datosGenerales, sexo: e.target.value})} className="w-full p-2 border rounded-lg"/>
+        </div>
+      </AccordionSection>
+      <AccordionSection title="2. Motivo de Consulta e Historia" sectionName="motivoConsulta" expandedSections={expandedSections} onToggle={toggleSection}>
+        <div className="space-y-4">
+          <textarea placeholder="Motivo de Consulta" value={motivoConsulta} onChange={e => setMotivoConsulta(e.target.value)} className="w-full p-2 border rounded-lg h-24"/>
+          <textarea placeholder="Historia de la Enfermedad" value={historiaEnfermedad} onChange={e => setHistoriaEnfermedad(e.target.value)} className="w-full p-2 border rounded-lg h-32"/>
+        </div>
+      </AccordionSection>
+      <AccordionSection title="3. Antecedentes" sectionName="antecedentes" expandedSections={expandedSections} onToggle={toggleSection}>
+        <h3 className="text-lg font-bold text-blue-700 mb-2">Personales</h3>
+        <textarea placeholder="Enfermedades, Cirugías, etc." value={antecedentesPersonales.enfermedades} onChange={e => setAntecedentesPersonales({...antecedentesPersonales, enfermedades: e.target.value})} className="w-full p-2 border rounded-lg h-24"/>
+        <h3 className="text-lg font-bold text-blue-700 mb-2 mt-4">Familiares</h3>
+        <textarea placeholder="Enfermedades familiares" value={antecedentesFamiliares.otros} onChange={e => setAntecedentesFamiliares({...antecedentesFamiliares, otros: e.target.value})} className="w-full p-2 border rounded-lg h-24"/>
+      </AccordionSection>
+      <AccordionSection title="4. Examen Físico" sectionName="examenFisico" expandedSections={expandedSections} onToggle={toggleSection}>
+        <textarea placeholder="Signos vitales y examen por sistemas" value={examenFisico.otros} onChange={e => setExamenFisico({...examenFisico, otros: e.target.value})} className="w-full p-2 border rounded-lg h-24"/>
+      </AccordionSection>
+      <AccordionSection title="5. Diagnóstico y Laboratorio" sectionName="diagnostico" expandedSections={expandedSections} onToggle={toggleSection}>
+          <textarea placeholder="Diagnóstico Nosológico (se llenará con la IA)" value={diagnosticoNosologico} onChange={e => setDiagnosticoNosologico(e.target.value)} className="w-full p-2 border rounded-lg h-24"/>
+          <textarea placeholder="Diagnóstico Diferencial" value={diagnosticoDiferencial} onChange={e => setDiagnosticoDiferencial(e.target.value)} className="w-full p-2 border rounded-lg h-24"/>
+          <h3 className="text-lg font-bold text-blue-700 mb-2 mt-4">Laboratorio e Imágenes</h3>
+          <textarea placeholder="Resultados" value={examenesLaboratorio.otros} onChange={e => setExamenesLaboratorio({...examenesLaboratorio, otros: e.target.value})} className="w-full p-2 border rounded-lg h-24"/>
+      </AccordionSection>
+      <AccordionSection title="6. Tratamiento" sectionName="tratamiento" expandedSections={expandedSections} onToggle={toggleSection}>
+        <textarea placeholder="Tratamiento" value={tratamiento} onChange={e => setTratamiento(e.target.value)} className="w-full p-2 border rounded-lg h-32"/>
+      </AccordionSection>
+
+      <div className="flex justify-between items-center mt-6 flex-wrap gap-2">
+        {selectedPatient && <button onClick={startNewConsultation} disabled={loading} className="py-3 px-6 rounded-lg text-white font-bold bg-orange-500 hover:bg-orange-600 disabled:bg-gray-400">Nueva Consulta</button>}
+        <button onClick={handleRunAnalysis} disabled={loading} className="py-3 px-6 rounded-lg text-white font-bold bg-indigo-600 hover:bg-indigo-700 disabled:bg-gray-400">Ejecutar Análisis IA</button>
+        <button onClick={guardarHistoriaClinica} disabled={loading || !datosGenerales.nombre.trim()} className="py-3 px-6 rounded-lg text-white font-bold bg-green-600 hover:bg-green-700 disabled:bg-gray-400 ml-auto">{loading ? 'Guardando...' : 'Guardar'}</button>
+      </div>
+    </div>
+  );
+};
+
+// --- Vista de Análisis ---
+const AnalysisView = ({ iterationsHistory, consensusResult, isLoading, loadingMessage, onBack, patientName }) => {
+    const [showIterationDetails, setShowIterationDetails] = useState(null);
+
+    return (
+        <div className="p-4 sm:p-6 lg:p-8 w-full">
+            <header className="flex justify-between items-center mb-6 pb-4 border-b">
+                <div>
+                    <h1 className="text-3xl font-bold text-gray-800">Resultados del Análisis IA</h1>
+                    <p className="text-lg text-gray-600">Paciente: {patientName}</p>
+                </div>
+                <button onClick={onBack} className="py-2 px-6 rounded-lg text-white font-bold bg-blue-600 hover:bg-blue-700 transition-colors">
+                    &larr; Volver a Datos del Paciente
+                </button>
+            </header>
+
+            {isLoading ? (
+                <div className="flex flex-col justify-center items-center p-6 bg-white rounded-lg shadow-lg h-full min-h-[50vh]">
+                    <svg className="animate-spin h-12 w-12 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                    <p className="mt-4 text-blue-600 font-semibold text-xl">{loadingMessage}</p>
+                </div>
+            ) : consensusResult ? (
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <div className="lg:col-span-2 space-y-6">
+                        {/* Consensus Panel */}
+                        <div className="bg-white p-6 rounded-xl shadow-lg">
+                            <h2 className="text-2xl font-bold text-gray-800 mb-4 pb-2 border-b">Consenso Diagnóstico</h2>
+                            {consensusResult.requires_human && (
+                                <div className="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-800 p-4 rounded-md mb-4">
+                                    <p className="font-bold">⚠️ Revisión Humana Requerida</p>
+                                    <p className="text-sm">La probabilidad del diagnóstico principal está por debajo del umbral de alta confianza.</p>
+                                </div>
+                            )}
+                            <div className="bg-blue-50 border border-blue-200 p-4 rounded-lg">
+                                <p className="text-blue-800 font-semibold">Diagnóstico Principal:</p>
+                                <p className="text-xl font-bold text-black">{consensusResult.top_diagnoses[0].label} ({consensusResult.top_diagnoses[0].code_icd10})</p>
+                                <p className="text-3xl font-bold text-blue-600">{(consensusResult.top_diagnoses[0].prob * 100).toFixed(1)}%</p>
+                            </div>
+                        </div>
+                        {/* Evidence Analysis */}
+                        <div className="bg-white p-6 rounded-xl shadow-lg">
+                             <h2 className="text-2xl font-bold text-gray-800 mb-4 pb-2 border-b">Análisis de Evidencia</h2>
+                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <h3 className="font-semibold text-green-700 mb-2">Evidencia de Apoyo (Datos que afirman la hipótesis)</h3>
+                                    <ul className="list-disc list-inside text-sm space-y-1">{consensusResult.evidence_analysis?.supporting_evidence?.map((item, i) => <li key={i}>{item}</li>)}</ul>
+                                </div>
+                                 <div>
+                                    <h3 className="font-semibold text-red-700 mb-2">Evidencia en Contra (Datos que rechazan la hipótesis)</h3>
+                                    <ul className="list-disc list-inside text-sm space-y-1">{consensusResult.evidence_analysis?.refuting_evidence?.map((item, i) => <li key={i}>{item}</li>)}</ul>
+                                </div>
+                             </div>
+                        </div>
+                        {/* Recommendations */}
+                        <div className="bg-white p-6 rounded-xl shadow-lg">
+                            <h2 className="text-2xl font-bold text-gray-800 mb-4 pb-2 border-b">Recomendaciones</h2>
+                            <ul className="space-y-2">
+                                <li><b>Pruebas Imprescindibles:</b> {consensusResult.recommendations.pruebas_imprescindibles?.join(', ')}</li>
+                                <li><b>Urgencias/Derivación:</b> {consensusResult.recommendations.urgencias_derivacion?.join(', ')}</li>
+                                <li><b>Tratamiento Inicial:</b> {consensusResult.recommendations.tratamiento_inicial?.join(', ')}</li>
+                            </ul>
+                             {consensusResult.discrepancies && <div className="mt-4"><h4 className="font-semibold">Discrepancias entre Módulos:</h4><p className="text-sm italic">{consensusResult.discrepancies}</p></div>}
+                        </div>
+                    </div>
+                    <div className="lg:col-span-1 space-y-6">
+                        {/* Differential Diagnoses */}
+                        <div className="bg-white p-6 rounded-xl shadow-lg">
+                             <h2 className="text-xl font-bold text-gray-800 mb-4 pb-2 border-b">Top 5 Diagnósticos Diferenciales</h2>
+                             <ul className="space-y-3">
+                                {consensusResult.top_diagnoses.map((dx, index) => (
+                                    <li key={dx.code_icd10} className={`p-3 rounded-lg border ${index === 0 ? 'bg-blue-50 border-blue-200' : 'bg-gray-50'}`}>
+                                        <div className="flex justify-between items-baseline">
+                                            <span className="font-bold text-gray-700">{index + 1}. {dx.label}</span>
+                                            <span className={`font-bold text-lg ${index === 0 ? 'text-blue-600' : 'text-gray-600'}`}>{(dx.prob * 100).toFixed(1)}%</span>
+                                        </div>
+                                        <span className="text-xs text-gray-500">{dx.code_icd10}</span>
+                                    </li>
+                                ))}
+                             </ul>
+                        </div>
+                        {/* Iterations Panel */}
+                        <div className="bg-white p-6 rounded-xl shadow-lg">
+                            <h2 className="text-xl font-bold text-gray-800 mb-4 pb-2 border-b">Panel de Iteraciones</h2>
+                            <div className="space-y-2">
+                                {iterationsHistory.map(item => (
+                                    <div key={item.iteration} className="border rounded-lg">
+                                        <button onClick={() => setShowIterationDetails(p => p === item.iteration ? null : item.iteration)} className="w-full text-left p-3 bg-gray-50 hover:bg-gray-100">
+                                            <h3 className="font-bold text-gray-800">Iteración #{item.iteration}</h3>
+                                        </button>
+                                        {showIterationDetails === item.iteration && <div className="p-4 border-t"><pre className="bg-gray-100 p-2 rounded-md text-xs overflow-x-auto">{JSON.stringify(item, null, 2)}</pre></div>}
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            ) : (
+                <div className="text-center p-10 bg-white rounded-lg shadow-lg">
+                    <p className="text-gray-500">Los resultados del análisis aparecerán aquí una vez que se complete.</p>
+                </div>
+            )}
+        </div>
+    );
+};
+
+// --- Componente Principal ---
+const HistoriaClinicaCubana = () => {
+  const [db, setDb] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [modalVisible, setModalVisible] = useState(false);
+  const [message, setMessage] = useState('');
+  const [confirmModalVisible, setConfirmModalVisible] = useState(false);
+  const [patientToDelete, setPatientToDelete] = useState(null);
+  const [patients, setPatients] = useState([]);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [selectedPatient, setSelectedPatient] = useState(null);
+  const [selectedConsultationId, setSelectedConsultationId] = useState(null);
+
+  // State for AI Engine
+  const [iterationsHistory, setIterationsHistory] = useState([]);
+  const [consensusResult, setConsensusResult] = useState(null);
+  const [isLoadingAI, setIsLoadingAI] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState('Iniciando análisis...');
+  const [diagnosticoNosologico, setDiagnosticoNosologico] = useState('');
+  
+  // State for navigation
+  const [currentPage, setCurrentPage] = useState('patientForm');
+
+  useEffect(() => {
+    if (consensusResult?.top_diagnoses?.[0]) {
+      const dx = consensusResult.top_diagnoses[0];
+      setDiagnosticoNosologico(`${dx.label} (${dx.code_icd10}) - ${(dx.prob * 100).toFixed(1)}%`);
+    }
+  }, [consensusResult]);
+
+  useEffect(() => {
+    async function initFirebase() {
+      try {
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const userCred = await (typeof __initial_auth_token !== 'undefined' ? signInWithCustomToken(auth, __initial_auth_token) : signInAnonymously(auth));
+        setDb(db); setUserId(userCred.user.uid); setIsAuthReady(true);
+      } catch (error) { console.error("Firebase init failed:", error); showMessage("Error al inicializar."); }
+    }
+    initFirebase();
+  }, []);
+
+  useEffect(() => {
+    if (!isAuthReady || !userId || !db) return;
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    const q = collection(db, `/artifacts/${appId}/users/${userId}/pacientes`);
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+        const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        list.sort((a, b) => (a.datosGenerales?.nombre || '').localeCompare(b.datosGenerales?.nombre || ''));
+        setPatients(list);
+    }, (error) => { console.error("Error fetching patients:", error); showMessage("Error al cargar pacientes."); });
+    return () => unsubscribe();
+  }, [isAuthReady, userId, db]);
+  
+  const filteredPatients = patients.filter(p => (p.datosGenerales?.nombre || '').toLowerCase().includes(searchTerm.toLowerCase()));
+  const showMessage = (msg) => { setMessage(msg); setModalVisible(true); };
+  const loadPatientData = (patient) => { setSelectedPatient(patient); setSelectedConsultationId(null); setConsensusResult(null); setIterationsHistory([]); };
+  const resetForm = () => { setSelectedPatient(null); setSelectedConsultationId(null); setConsensusResult(null); setIterationsHistory([]); };
+  const handleDeletePatient = (patient) => { setPatientToDelete(patient); setConfirmModalVisible(true); };
+
+  const confirmDeletePatient = async () => {
+    if (!db || !patientToDelete) return;
+    setLoading(true); setConfirmModalVisible(false);
+    try {
+      const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+      const docRef = doc(db, `/artifacts/${appId}/users/${userId}/pacientes/${patientToDelete.id}`);
+      const consultaSnap = await getDocs(collection(docRef, 'consultas'));
+      await Promise.all(consultaSnap.docs.map(d => deleteDoc(d.ref)));
+      await deleteDoc(docRef);
+      showMessage(`Historia de ${patientToDelete.datosGenerales.nombre} eliminada.`); resetForm();
+    } catch (error) { console.error("Error deleting:", error); showMessage("Error al eliminar."); } 
+    finally { setLoading(false); setPatientToDelete(null); }
+  };
+
+  const runCaseSimulation = async (patientDataForEngine) => {
+    setCurrentPage('analysisResult'); setIsLoadingAI(true); 
+    setLoadingMessage('Iniciando análisis...'); setIterationsHistory([]); setConsensusResult(null);
+    let prevIterationOutputs = {};
+    try {
+      for (let iteration = 1; iteration <= MAX_ITER; iteration++) {
+        setLoadingMessage(`Procesando Iteración #${iteration}...`);
+        let currentIterationOutputs = {};
+        const outC = await callGeminiAPI(generateModulePrompt("CLINICO", patientDataForEngine, iteration, prevIterationOutputs), moduleOutputSchema);
+        currentIterationOutputs.C = outC;
+        const outF = await callGeminiAPI(generateModulePrompt("FISIO", patientDataForEngine, iteration, currentIterationOutputs), moduleOutputSchema);
+        currentIterationOutputs.F = outF;
+        const outE = await callGeminiAPI(generateModulePrompt("EPID", patientDataForEngine, iteration, currentIterationOutputs), moduleOutputSchema);
+        currentIterationOutputs.E = outE;
+        setIterationsHistory(prev => [...prev, { iteration, outC, outF, outE }]);
+        prevIterationOutputs = currentIterationOutputs;
+      }
+      setLoadingMessage('Generando consenso final...');
+      const finalConsensusResult = await callGeminiAPI(generateConsensusPrompt(prevIterationOutputs, patientDataForEngine), consensusOutputSchema);
+      if (finalConsensusResult?.top_diagnoses?.[0]) {
+        finalConsensusResult.requires_human = (finalConsensusResult.top_diagnoses[0].prob || 0) < HUMAN_ACCEPTANCE_THRESHOLD;
+        setConsensusResult(finalConsensusResult);
+      } else { throw new Error("No se pudo generar un consenso válido."); }
+    } catch (error) { showMessage(`Error en análisis: ${error.message}.`); } 
+    finally { setIsLoadingAI(false); }
+  };
+
+  if (currentPage === 'analysisResult') {
+    return (
+        <AnalysisView 
+            iterationsHistory={iterationsHistory}
+            consensusResult={consensusResult}
+            isLoading={isLoadingAI}
+            loadingMessage={loadingMessage}
+            onBack={() => setCurrentPage('patientForm')}
+            patientName={selectedPatient?.datosGenerales?.nombre || 'N/A'}
+        />
+    );
+  }
+
+  return (
+    <div className="flex p-4 bg-gray-100 min-h-screen font-sans">
+      <div className="w-1/4 bg-gray-200 rounded-lg shadow-lg p-4 mr-4 flex flex-col max-h-[95vh]">
+        <h2 className="text-xl font-bold mb-4 text-center text-gray-700">Pacientes</h2>
+        <p className="text-xs text-gray-500 text-center mb-4 break-all">User ID: {userId || 'Cargando...'}</p>
+        <input type="text" placeholder="Buscar paciente..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="w-full p-2 mb-4 rounded-lg border"/>
+        <div className="flex-grow overflow-y-auto">
+          {filteredPatients.length > 0 ? (
+            <ul className="space-y-2">
+              {filteredPatients.map(p => (
+                <li key={p.id} onClick={() => loadPatientData(p)} className={`cursor-pointer p-2 rounded-lg flex justify-between items-center ${selectedPatient?.id === p.id ? 'bg-blue-500 text-white' : 'bg-white hover:bg-gray-50'}`}>
+                  <span className="truncate">{p.datosGenerales.nombre}</span>
+                  {selectedPatient?.id === p.id && <button onClick={(e) => { e.stopPropagation(); handleDeletePatient(p); }} className="text-red-200 hover:text-white ml-2 p-1 rounded-full" title="Eliminar"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm6 0a1 1 0 112 0v6a1 1 0 11-2 0V8z" clipRule="evenodd" /></svg></button>}
+                </li>
+              ))}
+            </ul>
+          ) : <p className="text-gray-500 text-center text-sm">No hay pacientes.</p>}
+        </div>
+        <button onClick={resetForm} className="w-full py-2 mt-4 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700 flex items-center justify-center">
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor"><path d="M10 5a1 1 0 011 1v3h3a1 1 0 110 2h-3v3a1 1 0 11-2 0v-3H6a1 1 0 110-2h3V6a1 1 0 011-1z" /></svg>
+          Añadir Paciente
+        </button>
+      </div>
+      <div className="flex-grow max-h-[95vh]">
+          <PatientForm
+            selectedPatient={selectedPatient} db={db} userId={userId} loading={loading} setLoading={setLoading}
+            showMessage={showMessage} onResetForm={resetForm} selectedConsultationId={selectedConsultationId}
+            setSelectedConsultationId={setSelectedConsultationId} runCaseSimulation={runCaseSimulation}
+            diagnosticoNosologico={diagnosticoNosologico} setDiagnosticoNosologico={setDiagnosticoNosologico}
+          />
+      </div>
+      {modalVisible && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg shadow-xl p-6 max-w-sm w-full">
+            <h3 className="text-lg font-bold mb-2">Estado</h3>
+            <p className="text-gray-700">{message}</p>
+            <div className="flex justify-end mt-4"><button onClick={() => setModalVisible(false)} className="px-4 py-2 bg-blue-500 text-white rounded-lg">OK</button></div>
+          </div>
+        </div>
+      )}
+      {confirmModalVisible && (
+        <div className="fixed inset-0 bg-gray-600 bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg shadow-xl p-6 max-w-sm w-full">
+            <h3 className="text-lg font-bold text-red-600 mb-2">Confirmar Eliminación</h3>
+            <p>¿Seguro que quieres eliminar la historia de <span className="font-bold">{patientToDelete?.datosGenerales.nombre}</span>?</p>
+            <div className="flex justify-end mt-4 space-x-2">
+              <button onClick={() => setConfirmModalVisible(false)} className="px-4 py-2 bg-gray-300 rounded-lg">Cancelar</button>
+              <button onClick={confirmDeletePatient} className="px-4 py-2 bg-red-600 text-white rounded-lg">Eliminar</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+function App() { return <HistoriaClinicaCubana />; }
+export default App;
